@@ -32,6 +32,9 @@ class TrainConfig:
     # PSG intervention
     path_shrink_lambda: float = 0.0  # shrink step displacement by 1/(1+2*lambda)
 
+    # gradient noise (for path perturbation)
+    grad_noise_std: float = 0.0
+
     # data noise during training
     input_noise_std: float = 0.0
 
@@ -109,6 +112,7 @@ def train_one_run(
     cfg: TrainConfig,
     device: str,
     log_every: int = 0,
+    return_path_profile: bool = False,
 ) -> Dict[str, Any]:
     model.to(device)
     model.train()
@@ -119,6 +123,13 @@ def train_one_run(
 
     loss_fn = nn.CrossEntropyLoss()
     path = PSGPathStats()
+
+    prof_step_disp: list[float] = []
+    prof_lr: list[float] = []
+    prof_grad_norm: list[float] = []
+
+    lr_sum = 0.0
+    grad_norm_sum = 0.0
 
     step = 0
     for _epoch in range(cfg.epochs):
@@ -138,6 +149,13 @@ def train_one_run(
             loss = loss_fn(logits, y)
             loss.backward()
 
+            # optional gradient noise (Condition C)
+            if cfg.grad_noise_std and cfg.grad_noise_std > 0:
+                for p in trainable_params:
+                    if p.grad is None:
+                        continue
+                    p.grad.add_(cfg.grad_noise_std * torch.randn_like(p.grad))
+
             grad_norm = float(global_l2_norm(p.grad for p in trainable_params).item())
 
             if cfg.grad_clip and cfg.grad_clip > 0:
@@ -155,6 +173,13 @@ def train_one_run(
             lr_now = float(optimizer.param_groups[0]["lr"])
             path.update(step_displacement_l2=float(step_disp.item()), lr=lr_now, grad_norm_l2=grad_norm)
 
+            lr_sum += lr_now
+            grad_norm_sum += grad_norm
+            if return_path_profile:
+                prof_step_disp.append(float(step_disp.item()))
+                prof_lr.append(lr_now)
+                prof_grad_norm.append(grad_norm)
+
             if scheduler is not None:
                 scheduler.step()
 
@@ -165,7 +190,10 @@ def train_one_run(
     train_metrics = evaluate(model, train_loader, device=device)
     test_metrics = evaluate(model, test_loader, device=device)
 
-    return {
+    avg_lr = lr_sum / max(path.steps, 1)
+    avg_grad_norm = grad_norm_sum / max(path.steps, 1)
+
+    out: Dict[str, Any] = {
         "train": train_metrics,
         "test": test_metrics,
         "gap_loss": float(test_metrics["loss"] - train_metrics["loss"]),
@@ -173,4 +201,15 @@ def train_one_run(
         "pl": float(path.pl),
         "ge": float(path.ge),
         "steps": int(path.steps),
+        "avg_lr": float(avg_lr),
+        "avg_grad_norm": float(avg_grad_norm),
     }
+
+    if return_path_profile:
+        out["path_profile"] = {
+            "step_disp_l2": prof_step_disp,
+            "lr": prof_lr,
+            "grad_norm_l2": prof_grad_norm,
+        }
+
+    return out
